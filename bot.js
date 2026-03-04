@@ -1,34 +1,54 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// Polymarket Whale Copy-Trader Bot
+// Polymarket Whale Copy-Trader Bot  (v2.0 — Multi-Whale, Persistent, Hardened)
 // ═══════════════════════════════════════════════════════════════════════════════
-// Monitors a target whale address on Polymarket via WebSocket and mirrors their
-// trades in real-time as $1.00 FOK (Fill-or-Kill) market orders.
+//
+// Monitors an array of whale addresses on Polymarket via WebSocket and mirrors
+// their trades in real-time as $1.00 FOK (Fill-or-Kill) market orders.
+//
+// v2.0 changes:
+//   • Multi-whale portfolio — tracks N whales from a comma-separated env var
+//   • Order book via clobClient.getSnapshot() (fixes getMarketOrderBook crash)
+//   • State persistence — filled orders saved to trades.json, loaded on boot
+//   • HTTP heartbeat — keeps Render's free tier from timing out on port scan
+//   • Hardened success check — only logs FILLED when response.success === true
 //
 // Architecture:
-//   1. Bootstraps the whale's current open positions from the Data API
-//   2. Opens a CLOB Market WebSocket to receive real-time trade events
-//   3. Cross-references each trade against the whale via the Data API
+//   1. Bootstraps every whale's current open positions from the Data API
+//   2. Opens a single CLOB Market WebSocket subscribed to the union of all
+//      whale asset_ids
+//   3. When a trade event fires, checks each whale via the Data API
 //   4. Executes a $1.00 FOK market order copying the whale's direction
-//
-// Why this architecture?
-//   - The CLOB "user" channel only streams YOUR OWN authenticated trades
-//   - The CLOB "market" channel streams `last_trade_price` for all trades on
-//     subscribed asset_ids — but does NOT include maker/taker addresses
-//   - Therefore: we subscribe to the whale's known asset_ids on the market
-//     channel, and when a trade fires, we verify it was the whale via a fast
-//     Data API call before copying. This avoids setInterval polling entirely.
-//   - As a supplementary safety net, we periodically refresh the whale's
-//     position list to pick up any NEW markets the whale enters.
+//   5. Persists every confirmed fill to trades.json for crash recovery
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import "dotenv/config";
 import { ClobClient, Side, OrderType } from "@polymarket/clob-client";
 import { Wallet } from "@ethersproject/wallet";
 import WebSocket from "ws";
+import fs from "node:fs";
+import path from "node:path";
+import { createServer } from "node:http";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
 // ─────────────────────────────────────────────────────────────────────────────
+// WHALE_ADDRESSES: comma-separated list in .env, e.g.
+//   WHALE_ADDRESSES=0xabc...,0xdef...,0x123...
+// Falls back to the single WHALE_ADDRESS var for backwards compatibility.
+function parseWhaleAddresses() {
+  const raw =
+    process.env.WHALE_ADDRESSES ||
+    process.env.WHALE_ADDRESS ||
+    "0xc088343e85E0Bd8334e662D358Ad92aeC5F945CA";
+
+  return [...new Set(
+    raw
+      .split(",")
+      .map((a) => a.trim().toLowerCase())
+      .filter((a) => a.length > 0),
+  )];
+}
+
 const CONFIG = Object.freeze({
   // Polymarket endpoints
   CLOB_HOST: "https://clob.polymarket.com",
@@ -37,24 +57,19 @@ const CONFIG = Object.freeze({
   GAMMA_API: "https://gamma-api.polymarket.com",
   CHAIN_ID: 137,
 
-  // Target whale to copy
-  WHALE_ADDRESS: (
-    process.env.WHALE_ADDRESS ||
-    "0xc088343e85E0Bd8334e662D358Ad92aeC5F945CA"
-  ).toLowerCase(),
+  // Target whales to copy (array of lowercase addresses)
+  WHALE_ADDRESSES: parseWhaleAddresses(),
 
   // Trade sizing — spend exactly $1.00 USDC per copied trade
   TRADE_AMOUNT_USD: 1.0,
 
-  // Slippage protection: worst acceptable price deviation from whale's price
-  // e.g. 0.05 means we'll accept up to 5 cents worse than the whale's price
+  // Static slippage ceiling (kept as a hard-cap safety net)
   MAX_SLIPPAGE: 0.05,
 
-  // Liquidity engine: max acceptable deviation from whale's price (1% = 0.01)
-  // The order book must have enough depth to fill our order within this band
+  // Liquidity engine: order book must fill within this % of whale's price
   MAX_SLIPPAGE_PCT: 0.01,
 
-  // How often to refresh the whale's position list to discover new markets (ms)
+  // How often to refresh whale positions to discover new markets (ms)
   POSITION_REFRESH_INTERVAL_MS: 60_000,
 
   // WebSocket reconnection
@@ -64,6 +79,12 @@ const CONFIG = Object.freeze({
 
   // Dedup window: ignore duplicate trade signals within this window (ms)
   DEDUP_WINDOW_MS: 5_000,
+
+  // Persistence file path
+  TRADES_DB_PATH: path.resolve(process.cwd(), "trades.json"),
+
+  // HTTP heartbeat port (Render expects a listening port)
+  HEARTBEAT_PORT: parseInt(process.env.PORT, 10) || 3000,
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -83,15 +104,103 @@ function validateEnv() {
 // Logging
 // ─────────────────────────────────────────────────────────────────────────────
 const log = {
-  info: (msg, ...args) => console.log(`[${ts()}] ℹ️  ${msg}`, ...args),
-  trade: (msg, ...args) => console.log(`[${ts()}] 💰 ${msg}`, ...args),
-  whale: (msg, ...args) => console.log(`[${ts()}] 🐋 ${msg}`, ...args),
-  warn: (msg, ...args) => console.warn(`[${ts()}] ⚠️  ${msg}`, ...args),
-  error: (msg, ...args) => console.error(`[${ts()}] ❌ ${msg}`, ...args),
-  ws: (msg, ...args) => console.log(`[${ts()}] 🔌 ${msg}`, ...args),
+  info:  (msg, ...a) => console.log(`[${ts()}] ℹ️  ${msg}`, ...a),
+  trade: (msg, ...a) => console.log(`[${ts()}] 💰 ${msg}`, ...a),
+  whale: (msg, ...a) => console.log(`[${ts()}] 🐋 ${msg}`, ...a),
+  warn:  (msg, ...a) => console.warn(`[${ts()}] ⚠️  ${msg}`, ...a),
+  error: (msg, ...a) => console.error(`[${ts()}] ❌ ${msg}`, ...a),
+  ws:    (msg, ...a) => console.log(`[${ts()}] 🔌 ${msg}`, ...a),
+  db:    (msg, ...a) => console.log(`[${ts()}] 💾 ${msg}`, ...a),
 };
 function ts() {
   return new Date().toISOString().slice(11, 23);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HTTP Heartbeat — prevents Render "Port Scan Timeout"
+// ─────────────────────────────────────────────────────────────────────────────
+// Uses Node's built-in http module — no Express dependency needed.
+// ─────────────────────────────────────────────────────────────────────────────
+function startHeartbeatServer() {
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      status: "ok",
+      uptime: process.uptime(),
+      whales: CONFIG.WHALE_ADDRESSES.length,
+    }));
+  });
+
+  server.listen(CONFIG.HEARTBEAT_PORT, () => {
+    log.info(`Heartbeat HTTP server listening on :${CONFIG.HEARTBEAT_PORT}`);
+  });
+
+  return server;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// State Persistence Layer — trades.json
+// ─────────────────────────────────────────────────────────────────────────────
+// Schema per entry:
+//   { orderID, price, side, whaleAddress, assetID, title, outcome, filledAt }
+//
+// On startup the bot loads the file so it knows its current holdings even
+// after a Render free-tier restart / crash.
+// ─────────────────────────────────────────────────────────────────────────────
+class TradeStore {
+  constructor(filePath) {
+    this.filePath = filePath;
+    this.trades = [];        // in-memory mirror of trades.json
+    this._writeLock = false; // simple guard against concurrent writes
+  }
+
+  /** Load existing trades.json into memory (safe on first boot / missing file) */
+  load() {
+    try {
+      if (fs.existsSync(this.filePath)) {
+        const raw = fs.readFileSync(this.filePath, "utf-8");
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          this.trades = parsed;
+          log.db(`Loaded ${this.trades.length} historical trade(s) from ${this.filePath}`);
+          return;
+        }
+      }
+    } catch (err) {
+      log.warn(`Could not parse ${this.filePath}, starting fresh: ${err.message}`);
+    }
+    this.trades = [];
+    log.db("No prior trade history found — starting with empty ledger.");
+  }
+
+  /** Append a filled trade and flush to disk */
+  async record(entry) {
+    this.trades.push({ ...entry, filledAt: new Date().toISOString() });
+    await this._flush();
+    log.db(
+      `Persisted fill #${this.trades.length}: ${entry.side} ` +
+      `${entry.assetID?.slice(0, 12)}… from whale ${entry.whaleAddress?.slice(0, 10)}…`,
+    );
+  }
+
+  /** Return all trades for a given asset (useful for position awareness) */
+  tradesForAsset(assetID) {
+    return this.trades.filter((t) => t.assetID === assetID);
+  }
+
+  /** Serialise-safe write with basic lock to avoid concurrent corruptions */
+  async _flush() {
+    if (this._writeLock) return;
+    this._writeLock = true;
+    try {
+      const data = JSON.stringify(this.trades, null, 2);
+      fs.writeFileSync(this.filePath, data, "utf-8");
+    } catch (err) {
+      log.error(`Failed to write ${this.filePath}: ${err.message}`);
+    } finally {
+      this._writeLock = false;
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -101,14 +210,13 @@ async function createClobClient() {
   const signer = new Wallet(process.env.PRIVATE_KEY);
   const myAddress = (await signer.getAddress()).toLowerCase();
 
-  // ── Self-Trade Prevention ──
-  if (myAddress === CONFIG.WHALE_ADDRESS) {
+  // ── Self-Trade Prevention (checks against ALL tracked whales) ──
+  if (CONFIG.WHALE_ADDRESSES.includes(myAddress)) {
     console.error("═══════════════════════════════════════════════════════════");
     console.error("🛑  SELF-TRADE PREVENTION TRIGGERED");
-    console.error("    Your wallet address matches the target whale address.");
+    console.error("    Your wallet address matches one of the target whales.");
     console.error("    This would create an infinite copy-trade loop.");
     console.error(`    Your address:  ${myAddress}`);
-    console.error(`    Whale address: ${CONFIG.WHALE_ADDRESS}`);
     console.error("═══════════════════════════════════════════════════════════");
     process.exit(1);
   }
@@ -119,16 +227,14 @@ async function createClobClient() {
     passphrase: process.env.POLY_PASSPHRASE,
   };
 
-  // signatureType 0 = EOA/MetaMask, 1 = Magic/Email proxy
-  // Using 0 for direct private key usage; change to 1 if using Magic wallet
-  const signatureType = 0;
+  const signatureType = 0; // 0 = EOA, 1 = Magic/Email proxy
 
   const client = new ClobClient(
     CONFIG.CLOB_HOST,
     CONFIG.CHAIN_ID,
     signer,
     creds,
-    signatureType
+    signatureType,
   );
 
   // Verify connectivity
@@ -142,33 +248,51 @@ async function createClobClient() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Whale Position Discovery
+// Whale Position Discovery  (multi-whale)
 // ─────────────────────────────────────────────────────────────────────────────
-// Fetches the whale's current open positions from the Data API and returns
-// a Map of asset_id → position metadata (conditionId, outcome, side, etc.)
+// Fetches positions for ALL whales in parallel via Promise.allSettled and
+// returns a single merged Map of asset_id → metadata.
+// When two whales hold the same asset the first-seen entry wins (the
+// metadata is identical across holders; verifyWhaleTrade still identifies
+// the actual actor at trade time).
 // ─────────────────────────────────────────────────────────────────────────────
-async function fetchWhalePositions() {
-  const url = `${CONFIG.DATA_API}/positions?user=${CONFIG.WHALE_ADDRESS}`;
-  const resp = await fetch(url);
-  if (!resp.ok) {
-    throw new Error(`Data API /positions returned ${resp.status}: ${await resp.text()}`);
-  }
-  const positions = await resp.json();
-  const assetMap = new Map();
+async function fetchAllWhalePositions() {
+  const combined = new Map();
 
-  for (const pos of positions) {
-    if (pos.asset && pos.size > 0) {
-      assetMap.set(pos.asset, {
-        conditionId: pos.conditionId,
-        title: pos.title || "Unknown Market",
-        outcome: pos.outcome || "Unknown",
-        slug: pos.slug || "",
-        curPrice: pos.curPrice || 0,
-      });
+  const results = await Promise.allSettled(
+    CONFIG.WHALE_ADDRESSES.map(async (addr) => {
+      const url = `${CONFIG.DATA_API}/positions?user=${addr}`;
+      const resp = await fetch(url);
+      if (!resp.ok) {
+        throw new Error(`Data API /positions for ${addr} returned ${resp.status}`);
+      }
+      const positions = await resp.json();
+      return { addr, positions };
+    }),
+  );
+
+  for (const result of results) {
+    if (result.status === "rejected") {
+      log.warn(`Whale position fetch failed: ${result.reason}`);
+      continue;
+    }
+
+    const { addr, positions } = result.value;
+    for (const pos of positions) {
+      if (pos.asset && pos.size > 0 && !combined.has(pos.asset)) {
+        combined.set(pos.asset, {
+          conditionId: pos.conditionId,
+          title: pos.title || "Unknown Market",
+          outcome: pos.outcome || "Unknown",
+          slug: pos.slug || "",
+          curPrice: pos.curPrice || 0,
+          whaleAddress: addr,
+        });
+      }
     }
   }
 
-  return assetMap;
+  return combined;
 }
 
 // Fetches market metadata from Gamma to get tickSize and negRisk for a token
@@ -193,134 +317,129 @@ async function fetchMarketInfo(conditionId) {
   return null;
 }
 
-// Quick check: was a recent trade on this asset actually by the whale?
-// Queries the Data API /activity endpoint for the whale's most recent activity.
+// ─────────────────────────────────────────────────────────────────────────────
+// Whale Trade Verification  (multi-whale)
+// ─────────────────────────────────────────────────────────────────────────────
+// Queries every tracked whale in parallel.  Returns the first match with a
+// `whaleAddress` field attached so the caller knows exactly who traded.
+// ─────────────────────────────────────────────────────────────────────────────
 async function verifyWhaleTrade(assetId) {
-  try {
-    const now = Math.floor(Date.now() / 1000);
-    const lookback = now - 30; // last 30 seconds
-    const url =
-      `${CONFIG.DATA_API}/activity` +
-      `?user=${CONFIG.WHALE_ADDRESS}` +
-      `&type=TRADE` +
-      `&start=${lookback}` +
-      `&sortBy=TIMESTAMP&sortDirection=DESC`;
+  const now = Math.floor(Date.now() / 1000);
+  const lookback = now - 30; // last 30 seconds
 
-    const resp = await fetch(url);
-    if (!resp.ok) return null;
+  const results = await Promise.allSettled(
+    CONFIG.WHALE_ADDRESSES.map(async (addr) => {
+      const url =
+        `${CONFIG.DATA_API}/activity` +
+        `?user=${addr}` +
+        `&type=TRADE` +
+        `&start=${lookback}` +
+        `&sortBy=TIMESTAMP&sortDirection=DESC`;
 
-    const activities = await resp.json();
-    // Find a trade matching this asset
-    const match = activities.find((a) => a.asset === assetId);
-    if (match) {
-      return {
-        side: match.side,       // "BUY" or "SELL"
-        price: match.price,
-        size: match.size,
-        asset: match.asset,
-        conditionId: match.conditionId,
-        outcome: match.outcome,
-        title: match.title,
-        slug: match.slug,
-      };
-    }
-  } catch (err) {
-    log.warn(`Whale verification failed: ${err.message}`);
+      const resp = await fetch(url);
+      if (!resp.ok) return null;
+
+      const activities = await resp.json();
+      const match = activities.find((a) => a.asset === assetId);
+      if (match) {
+        return {
+          whaleAddress: addr,
+          side: match.side,       // "BUY" or "SELL"
+          price: match.price,
+          size: match.size,
+          asset: match.asset,
+          conditionId: match.conditionId,
+          outcome: match.outcome,
+          title: match.title,
+          slug: match.slug,
+        };
+      }
+      return null;
+    }),
+  );
+
+  // Return the first whale that actually matched
+  for (const r of results) {
+    if (r.status === "fulfilled" && r.value) return r.value;
   }
   return null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Trade Execution Engine
+// Liquidity Engine — Order Book Depth Analysis  (uses getSnapshot)
 // ─────────────────────────────────────────────────────────────────────────────
-// Deduplication: prevent firing multiple orders for the same trade signal
-const recentTrades = new Map(); // asset_id+side → timestamp
-
-function isDuplicate(assetId, side) {
-  const key = `${assetId}:${side}`;
-  const last = recentTrades.get(key);
-  const now = Date.now();
-  if (last && now - last < CONFIG.DEDUP_WINDOW_MS) {
-    return true;
-  }
-  recentTrades.set(key, now);
-  // Prune old entries
-  for (const [k, v] of recentTrades) {
-    if (now - v > CONFIG.DEDUP_WINDOW_MS * 2) recentTrades.delete(k);
-  }
-  return false;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Liquidity Engine — Order Book Depth Analysis
-// ─────────────────────────────────────────────────────────────────────────────
-// Fetches the L2 order book for an asset and determines whether TRADE_AMOUNT_USD
-// can be filled within MAX_SLIPPAGE_PCT of the whale's reported price.
+// clobClient.getSnapshot(tokenID) returns the L2 order book:
+//   { bids: [{ price: "0.55", size: "120" }, …],
+//     asks: [{ price: "0.56", size: "80"  }, …] }
+//
+// We walk the relevant side (asks for BUY, bids for SELL) and verify that
+// TRADE_AMOUNT_USD can be completely filled within a 1% band of the whale's
+// reported price.
 //
 // Returns:
 //   { ok: true,  effectivePrice, fillableVolume }   — safe to execute
 //   { ok: false, reason, effectivePrice?, fillableVolume? } — skip trade
 // ─────────────────────────────────────────────────────────────────────────────
 async function checkLiquidity(clobClient, asset, side, whalePrice) {
-  let orderBook;
+  let snapshot;
   try {
-    orderBook = await clobClient.getMarketOrderBook(asset);
+    snapshot = await clobClient.getSnapshot(asset);
   } catch (err) {
     return {
       ok: false,
-      reason: `Order book fetch failed: ${err.message}`,
+      reason: `Order book snapshot fetch failed: ${err.message}`,
     };
   }
 
-  if (!orderBook) {
-    return { ok: false, reason: "Order book returned null/undefined" };
+  if (!snapshot) {
+    return { ok: false, reason: "Snapshot returned null/undefined" };
   }
 
-  // For a BUY copy, we lift the Asks (sell side of the book).
-  // For a SELL copy, we hit the Bids (buy side of the book).
+  // For a BUY copy we lift the Asks; for a SELL copy we hit the Bids
   const levels = side === "BUY"
-    ? (orderBook.asks || [])
-    : (orderBook.bids || []);
+    ? (snapshot.asks || [])
+    : (snapshot.bids || []);
 
   if (levels.length === 0) {
     return { ok: false, reason: "No liquidity levels on relevant side of book" };
   }
 
-  // The 1% price band we'll tolerate
+  // 1% price band boundaries
   const maxDeviation = whalePrice * CONFIG.MAX_SLIPPAGE_PCT;
   const priceCeiling = side === "BUY"
     ? Math.min(whalePrice + maxDeviation, 0.99)  // worst ask we'd accept
-    : whalePrice;                                  // for sells, anything at or above floor
+    : whalePrice;                                  // sells: anything ≥ floor
   const priceFloor = side === "BUY"
-    ? whalePrice                                   // for buys, anything at or below ceiling
+    ? whalePrice                                   // buys:  anything ≤ ceiling
     : Math.max(whalePrice - maxDeviation, 0.01);   // worst bid we'd accept
 
-  // Walk the book levels, accumulating fill volume within the price band
-  let fillableVolume = 0;   // total USDC fillable within band
-  let weightedCostSum = 0;  // for VWAP calculation
+  // Walk the book accumulating fillable USDC within the band
+  let fillableVolume = 0;   // cumulative USDC we can fill
+  let sharesAccum    = 0;   // cumulative shares for VWAP
+  let costAccum      = 0;   // cumulative cost   for VWAP
 
   for (const level of levels) {
     const levelPrice = parseFloat(level.price);
-    const levelSize  = parseFloat(level.size);
+    const levelSize  = parseFloat(level.size);   // shares/contracts at this level
 
-    // Check price is within our acceptable band
-    if (side === "BUY" && levelPrice > priceCeiling) break;   // asks sorted ascending
-    if (side === "SELL" && levelPrice < priceFloor) break;     // bids sorted descending
+    // Asks are sorted ascending; bids are sorted descending
+    if (side === "BUY"  && levelPrice > priceCeiling) break;
+    if (side === "SELL" && levelPrice < priceFloor)   break;
 
-    const levelNotional = levelPrice * levelSize; // USDC value at this level
+    const levelNotional = levelPrice * levelSize;
+    const remainingUSD  = CONFIG.TRADE_AMOUNT_USD - fillableVolume;
+    const takeUSD       = Math.min(levelNotional, remainingUSD);
+    const takeShares    = takeUSD / levelPrice;
 
-    const remaining = CONFIG.TRADE_AMOUNT_USD - fillableVolume;
-    const take = Math.min(levelNotional, remaining);
-
-    fillableVolume += take;
-    weightedCostSum += levelPrice * (take / levelPrice); // shares × price for VWAP
+    fillableVolume += takeUSD;
+    sharesAccum    += takeShares;
+    costAccum      += takeShares * levelPrice;
 
     if (fillableVolume >= CONFIG.TRADE_AMOUNT_USD) break;
   }
 
-  const effectivePrice = fillableVolume > 0
-    ? weightedCostSum / (fillableVolume / (fillableVolume / weightedCostSum || 1))
-    : 0;
+  // Volume-weighted average price across consumed levels
+  const effectivePrice = sharesAccum > 0 ? costAccum / sharesAccum : 0;
 
   if (fillableVolume < CONFIG.TRADE_AMOUNT_USD) {
     return {
@@ -337,42 +456,64 @@ async function checkLiquidity(clobClient, asset, side, whalePrice) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Trade Execution — Hardened
+// Trade Execution Engine
 // ─────────────────────────────────────────────────────────────────────────────
-async function executeCopyTrade(clobClient, whaleTrade) {
-  const { side, price, asset, conditionId, outcome, title } = whaleTrade;
+const recentTrades = new Map(); // dedup: "assetId:side" → timestamp
+
+function isDuplicate(assetId, side) {
+  const key = `${assetId}:${side}`;
+  const last = recentTrades.get(key);
+  const now = Date.now();
+  if (last && now - last < CONFIG.DEDUP_WINDOW_MS) return true;
+  recentTrades.set(key, now);
+  // Prune old entries
+  for (const [k, v] of recentTrades) {
+    if (now - v > CONFIG.DEDUP_WINDOW_MS * 2) recentTrades.delete(k);
+  }
+  return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// executeCopyTrade — Hardened, persistence-aware, multi-whale
+// ─────────────────────────────────────────────────────────────────────────────
+async function executeCopyTrade(clobClient, whaleTrade, tradeStore) {
+  const { side, price, asset, conditionId, outcome, title, whaleAddress } = whaleTrade;
 
   if (isDuplicate(asset, side)) {
     log.warn(`Dedup: skipping duplicate ${side} on "${title}" (${outcome})`);
     return;
   }
 
-  log.whale(`Detected whale ${side} on "${title}" [${outcome}] @ ${price}`);
+  const whaleTag = whaleAddress
+    ? `whale ${whaleAddress.slice(0, 8)}…${whaleAddress.slice(-4)}`
+    : "whale (unknown)";
 
-  // ── Step 1: Fetch market-specific parameters (tickSize, negRisk) ──
+  log.whale(`Detected ${whaleTag} ${side} on "${title}" [${outcome}] @ ${price}`);
+
+  // ── Step 1: Market metadata ──
   const marketInfo = await fetchMarketInfo(conditionId);
   if (!marketInfo) {
     log.error(`Cannot fetch market info for conditionId=${conditionId} — skipping`);
     return;
   }
 
-  // ── Step 2: Liquidity pre-flight via order book depth analysis ──
+  // ── Step 2: Liquidity pre-flight via order book depth ──
   const whalePrice = parseFloat(price);
   const liquidity = await checkLiquidity(clobClient, asset, side, whalePrice);
 
   if (!liquidity.ok) {
     log.warn(
-      `⛔ LIQUIDITY WARNING: Spread too wide — skipping ${side} on "${title}" [${outcome}]`
+      `⛔ LIQUIDITY WARNING: Spread too wide — skipping ${side} on "${title}" [${outcome}]`,
     );
     log.warn(
       `   Reason: ${liquidity.reason} | ` +
       `whalePrice=${whalePrice.toFixed(4)} | ` +
-      `1% band=±${(whalePrice * CONFIG.MAX_SLIPPAGE_PCT).toFixed(4)}`
+      `1% band=±${(whalePrice * CONFIG.MAX_SLIPPAGE_PCT).toFixed(4)}`,
     );
     return;
   }
 
-  // ── Step 3: Compute worst acceptable price from the liquidity band ──
+  // ── Step 3: Worst acceptable price from the 1% liquidity band ──
   const maxDeviation = whalePrice * CONFIG.MAX_SLIPPAGE_PCT;
   let worstPrice;
   if (side === "BUY") {
@@ -385,9 +526,10 @@ async function executeCopyTrade(clobClient, whaleTrade) {
 
   log.trade(
     `Placing FOK ${side} | $${CONFIG.TRADE_AMOUNT_USD} USDC | ` +
-    `token=${asset.slice(0, 12)}... | worst_price=${worstPrice.toFixed(4)} | ` +
+    `token=${asset.slice(0, 12)}… | worst_price=${worstPrice.toFixed(4)} | ` +
     `tick=${marketInfo.tickSize} | negRisk=${marketInfo.negRisk} | ` +
-    `bookDepth=$${liquidity.fillableVolume.toFixed(4)} available`
+    `bookDepth=$${liquidity.fillableVolume.toFixed(4)} available | ` +
+    `triggered by ${whaleTag}`,
   );
 
   // ── Step 4: Place the order ──
@@ -403,23 +545,34 @@ async function executeCopyTrade(clobClient, whaleTrade) {
         tickSize: marketInfo.tickSize,
         negRisk: marketInfo.negRisk,
       },
-      OrderType.FOK
+      OrderType.FOK,
     );
 
-    // ── Hardened success check ──
-    // Only declare FILLED when the response object explicitly confirms it.
-    // A 403, network error, or missing `success` field must never be logged
-    // as a fill.
+    // ── Hardened success gate ──
+    // ONLY log FILLED when the CLOB explicitly returns { success: true }.
+    // A 403 geoblock, network error, or any response without an explicit
+    // true value for .success is treated as a failure.
     if (
       response &&
       typeof response === "object" &&
       response.success === true
     ) {
-      const orderId =
-        response.orderID || response.orderIds?.[0] || "N/A";
+      const orderId = response.orderID || response.orderIds?.[0] || "N/A";
       log.trade(
-        `✅ Order FILLED — ${side} "${title}" [${outcome}] | orderID=${orderId}`
+        `✅ Order FILLED — ${side} "${title}" [${outcome}] | ` +
+        `orderID=${orderId} | via ${whaleTag}`,
       );
+
+      // ── Persist the fill to trades.json ──
+      await tradeStore.record({
+        orderID: orderId,
+        price: worstPrice,
+        side,
+        whaleAddress: whaleAddress || "unknown",
+        assetID: asset,
+        title,
+        outcome,
+      });
     } else {
       // Explicit failure or ambiguous response — never treat as success
       const reason =
@@ -430,7 +583,7 @@ async function executeCopyTrade(clobClient, whaleTrade) {
       const status = response?.status || response?.statusCode || "";
       log.error(
         `Order NOT confirmed — ${side} "${title}" [${outcome}] | ` +
-        `status=${status} | reason=${reason}`
+        `status=${status} | reason=${reason}`,
       );
     }
   } catch (err) {
@@ -444,17 +597,17 @@ function handleOrderError(err, side, title, outcome) {
   if (msg.includes("403") || msg.includes("Forbidden") || msg.includes("geo")) {
     log.error(
       `🚫 ACCESS DENIED (403) — your IP or account may be geoblocked by Polymarket. ` +
-      `${side} "${title}" [${outcome}] was NOT executed.`
+      `${side} "${title}" [${outcome}] was NOT executed.`,
     );
   } else if (msg.includes("not enough balance") || msg.includes("insufficient")) {
     log.error(
       `💸 INSUFFICIENT FUNDS — cannot ${side} "${title}" [${outcome}]. ` +
-      `Top up your Polymarket wallet with USDC.e on Polygon.`
+      `Top up your Polymarket wallet with USDC.e on Polygon.`,
     );
   } else if (msg.includes("slippage") || msg.includes("FOK") || msg.includes("not enough liquidity")) {
     log.error(
       `📉 SLIPPAGE/LIQUIDITY — FOK order for "${title}" [${outcome}] could not fill. ` +
-      `The order book may have moved since the whale's trade.`
+      `The order book may have moved since the whale's trade.`,
     );
   } else if (msg.includes("rate limit") || msg.includes("429")) {
     log.error(`⏳ RATE LIMITED — backing off. Will retry on next signal.`);
@@ -464,16 +617,21 @@ function handleOrderError(err, side, title, outcome) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WebSocket Manager
+// WebSocket Manager  (multi-whale aware)
 // ─────────────────────────────────────────────────────────────────────────────
-// Connects to the CLOB Market WebSocket and subscribes to all asset_ids
-// where the whale has open positions. When a `last_trade_price` event fires,
-// we verify the whale made the trade and then execute our copy order.
+// Connects to the CLOB Market WebSocket and subscribes to the union of all
+// asset_ids held by any tracked whale.  When a `last_trade_price` event fires
+// we verify which whale made the trade, then execute our copy order.
+//
+// Race-condition guard: a per-asset lock (_processingLock) prevents two
+// simultaneous events on the same asset from spawning duplicate orders — this
+// matters when multiple whales trade the same market at the same time.
 // ─────────────────────────────────────────────────────────────────────────────
 class WhaleWatcher {
-  constructor(clobClient, myAddress) {
+  constructor(clobClient, myAddress, tradeStore) {
     this.clobClient = clobClient;
     this.myAddress = myAddress;
+    this.tradeStore = tradeStore;
     this.ws = null;
     this.pingInterval = null;
     this.positionRefreshInterval = null;
@@ -481,25 +639,30 @@ class WhaleWatcher {
     this.subscribedAssets = new Set();
     this.assetMap = new Map();   // asset_id → position metadata
     this.isShuttingDown = false;
+    this._processingLock = new Set(); // per-asset lock to prevent races
   }
 
   async start() {
     log.info("═══════════════════════════════════════════════════════════");
-    log.info("  Polymarket Whale Copy-Trader Bot");
+    log.info("  Polymarket Whale Copy-Trader Bot  v2.0");
     log.info("═══════════════════════════════════════════════════════════");
-    log.info(`  Target whale:   ${CONFIG.WHALE_ADDRESS}`);
+    log.info(`  Tracking ${CONFIG.WHALE_ADDRESSES.length} whale(s):`);
+    for (const addr of CONFIG.WHALE_ADDRESSES) {
+      log.info(`    • ${addr}`);
+    }
     log.info(`  Trade amount:   $${CONFIG.TRADE_AMOUNT_USD} USDC (FOK)`);
-    log.info(`  Max slippage:   ${CONFIG.MAX_SLIPPAGE}`);
+    log.info(`  Max slippage:   ${(CONFIG.MAX_SLIPPAGE_PCT * 100).toFixed(1)}% (order book depth)`);
     log.info(`  Your address:   ${this.myAddress}`);
+    log.info(`  Trade history:  ${this.tradeStore.trades.length} prior fill(s) loaded`);
     log.info("═══════════════════════════════════════════════════════════");
 
-    // 1. Bootstrap: discover whale's current positions
+    // 1. Bootstrap: discover all whales' current positions
     await this.refreshWhalePositions();
 
     // 2. Connect WebSocket
     this.connect();
 
-    // 3. Periodically refresh positions to discover new markets the whale enters
+    // 3. Periodically refresh to discover new markets any whale enters
     this.positionRefreshInterval = setInterval(async () => {
       await this.refreshWhalePositions();
       this.subscribeNewAssets();
@@ -508,10 +671,15 @@ class WhaleWatcher {
 
   async refreshWhalePositions() {
     try {
-      this.assetMap = await fetchWhalePositions();
+      this.assetMap = await fetchAllWhalePositions();
+
+      const uniqueConditions = new Set(
+        [...this.assetMap.values()].map((v) => v.conditionId),
+      );
       log.whale(
-        `Tracking ${this.assetMap.size} whale positions ` +
-        `across ${new Set([...this.assetMap.values()].map((v) => v.conditionId)).size} markets`
+        `Tracking ${this.assetMap.size} asset(s) ` +
+        `across ${uniqueConditions.size} market(s) ` +
+        `from ${CONFIG.WHALE_ADDRESSES.length} whale(s)`,
       );
     } catch (err) {
       log.error(`Failed to refresh whale positions: ${err.message}`);
@@ -521,7 +689,7 @@ class WhaleWatcher {
   connect() {
     if (this.isShuttingDown) return;
 
-    log.ws(`Connecting to ${CONFIG.WS_URL}...`);
+    log.ws(`Connecting to ${CONFIG.WS_URL}…`);
     this.ws = new WebSocket(CONFIG.WS_URL);
 
     this.ws.on("open", () => {
@@ -551,13 +719,12 @@ class WhaleWatcher {
     const assetIds = [...this.assetMap.keys()];
     if (assetIds.length === 0) {
       log.warn(
-        "Whale has no open positions — WebSocket will idle. " +
-        "Positions will be rechecked in 60s."
+        "No whale has open positions — WebSocket will idle. " +
+        "Positions will be rechecked in 60s.",
       );
       return;
     }
 
-    // The market channel accepts asset_ids (token IDs)
     const subscribeMsg = JSON.stringify({
       assets_ids: assetIds,
       type: "market",
@@ -569,7 +736,6 @@ class WhaleWatcher {
     log.ws(`Subscribed to ${assetIds.length} asset(s)`);
   }
 
-  // Subscribe only to newly discovered assets (whale entered a new market)
   subscribeNewAssets() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
@@ -594,15 +760,13 @@ class WhaleWatcher {
       const text = typeof raw === "string" ? raw : raw.toString();
       data = JSON.parse(text);
     } catch {
-      return; // Ignore malformed messages (pong frames, etc.)
+      return; // pong frames, malformed messages, etc.
     }
 
-    // We're interested in last_trade_price events — these fire whenever a
-    // trade executes on a subscribed asset_id
     if (Array.isArray(data)) {
-      for (const event of data) {
-        await this.processEvent(event);
-      }
+      // Process events concurrently — the per-asset lock inside processEvent
+      // prevents duplicate orders when multiple events fire on the same asset
+      await Promise.allSettled(data.map((event) => this.processEvent(event)));
     } else {
       await this.processEvent(data);
     }
@@ -614,26 +778,35 @@ class WhaleWatcher {
     const assetId = event.asset_id;
     if (!assetId || !this.assetMap.has(assetId)) return;
 
-    // A trade happened on one of the whale's assets.
-    // Verify it was actually the whale (not someone else trading in that market).
-    log.info(
-      `Trade detected on whale's asset ${assetId.slice(0, 16)}... | ` +
-      `price=${event.price} side=${event.side} size=${event.size}`
-    );
+    // ── Per-asset lock: prevents race conditions when multiple whales ──
+    // ── or rapid-fire events hit the same asset simultaneously        ──
+    if (this._processingLock.has(assetId)) return;
+    this._processingLock.add(assetId);
 
-    const whaleTrade = await verifyWhaleTrade(assetId);
-    if (!whaleTrade) {
-      log.info("  → Not the whale's trade, ignoring.");
-      return;
+    try {
+      log.info(
+        `Trade detected on tracked asset ${assetId.slice(0, 16)}… | ` +
+        `price=${event.price} side=${event.side} size=${event.size}`,
+      );
+
+      // Check all whales — returns the first match with whaleAddress attached
+      const whaleTrade = await verifyWhaleTrade(assetId);
+      if (!whaleTrade) {
+        log.info("  → Not a tracked whale's trade, ignoring.");
+        return;
+      }
+
+      const whaleTag =
+        `${whaleTrade.whaleAddress.slice(0, 8)}…${whaleTrade.whaleAddress.slice(-4)}`;
+      log.whale(
+        `CONFIRMED ${whaleTag} ${whaleTrade.side} on "${whaleTrade.title}" ` +
+        `[${whaleTrade.outcome}] @ ${whaleTrade.price} (${whaleTrade.size} shares)`,
+      );
+
+      await executeCopyTrade(this.clobClient, whaleTrade, this.tradeStore);
+    } finally {
+      this._processingLock.delete(assetId);
     }
-
-    log.whale(
-      `CONFIRMED whale ${whaleTrade.side} on "${whaleTrade.title}" ` +
-      `[${whaleTrade.outcome}] @ ${whaleTrade.price} (${whaleTrade.size} shares)`
-    );
-
-    // Execute our copy trade
-    await executeCopyTrade(this.clobClient, whaleTrade);
   }
 
   startPing() {
@@ -662,9 +835,9 @@ class WhaleWatcher {
     this.reconnectAttempt++;
     const delay = Math.min(
       CONFIG.WS_RECONNECT_BASE_MS * 2 ** (this.reconnectAttempt - 1),
-      CONFIG.WS_RECONNECT_MAX_MS
+      CONFIG.WS_RECONNECT_MAX_MS,
     );
-    log.ws(`Reconnecting in ${(delay / 1000).toFixed(1)}s (attempt #${this.reconnectAttempt})...`);
+    log.ws(`Reconnecting in ${(delay / 1000).toFixed(1)}s (attempt #${this.reconnectAttempt})…`);
     setTimeout(() => this.connect(), delay);
   }
 
@@ -687,13 +860,22 @@ class WhaleWatcher {
 async function main() {
   validateEnv();
 
+  // ── HTTP heartbeat (Render port scan prevention) ──
+  startHeartbeatServer();
+
+  // ── Load persistent trade history ──
+  const tradeStore = new TradeStore(CONFIG.TRADES_DB_PATH);
+  tradeStore.load();
+
+  // ── Initialize CLOB client ──
   const { client: clobClient, myAddress } = await createClobClient();
 
-  const watcher = new WhaleWatcher(clobClient, myAddress);
+  // ── Start watcher ──
+  const watcher = new WhaleWatcher(clobClient, myAddress, tradeStore);
 
-  // Graceful shutdown on SIGINT/SIGTERM
+  // Graceful shutdown
   const shutdown = () => {
-    log.info("Received shutdown signal...");
+    log.info("Received shutdown signal…");
     watcher.shutdown();
     process.exit(0);
   };
