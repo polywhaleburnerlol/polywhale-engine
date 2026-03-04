@@ -1,9 +1,17 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// Polymarket Whale Copy-Trader Bot  (v3.0 — Activity-Driven Hunter)
+// Polymarket Whale Copy-Trader Bot  (v3.1 — Production-Ready)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // Monitors an array of whale addresses on Polymarket and mirrors their trades
 // in real-time as $1.00 FOK (Fill-or-Kill) market orders.
+//
+// v3.1 — production polish:
+//   • pollAllWhaleActivity: public method name for the core polling loop
+//   • [HEARTBEAT] every 10s with exact format:
+//       Whales Scanned | Total Assets Hooked | Last API Response | Memory
+//   • [TRADE SIGNAL] bold banner on every detection BEFORE order placement
+//   • Verbose WebSocket reconnect: every attempt logged with delay + attempt #
+//   • Kept: HTTP heartbeat :3000, trades.json, liquidity engine, hardened gate
 //
 // v3.0 — architectural overhaul:
 //   The /positions endpoint returns empty arrays for many CLOB-native whales.
@@ -86,8 +94,8 @@ const CONFIG = Object.freeze({
   // Dedup — widened to 10s so the Activity Poller and WS path don't double-fire
   DEDUP_WINDOW_MS: 10_000,
 
-  // 1-second Pulse log
-  PULSE_INTERVAL_MS: 1_000,
+  // [HEARTBEAT] log interval — proves the bot is alive in Render logs
+  HEARTBEAT_LOG_INTERVAL_MS: 10_000,
 
   // Persistence
   TRADES_DB_PATH: path.resolve(process.cwd(), "trades.json"),
@@ -120,7 +128,7 @@ const log = {
   error: (msg, ...a) => console.error(`[${ts()}] ❌ ${msg}`, ...a),
   ws:    (msg, ...a) => console.log(`[${ts()}] 🔌 ${msg}`, ...a),
   db:    (msg, ...a) => console.log(`[${ts()}] 💾 ${msg}`, ...a),
-  pulse: (msg, ...a) => console.log(`[${ts()}] 📡 ${msg}`, ...a),
+  hb:    (msg, ...a) => console.log(`[${ts()}] 💓 ${msg}`, ...a),
 };
 
 function ts() {
@@ -532,8 +540,8 @@ class ActivityPoller {
       `every ${CONFIG.ACTIVITY_POLL_INTERVAL_MS / 1000}s`,
     );
     // Fire the first poll immediately, then repeat on the interval
-    this._poll();
-    this._pollTimer = setInterval(() => this._poll(), CONFIG.ACTIVITY_POLL_INTERVAL_MS);
+    this.pollAllWhaleActivity();
+    this._pollTimer = setInterval(() => this.pollAllWhaleActivity(), CONFIG.ACTIVITY_POLL_INTERVAL_MS);
   }
 
   stop() {
@@ -543,8 +551,8 @@ class ActivityPoller {
     }
   }
 
-  // ── Core poll cycle ──
-  async _poll() {
+  // ── Core poll cycle — public name for external reference ──
+  async pollAllWhaleActivity() {
     if (this._isPolling) return;   // previous cycle still in-flight
     this._isPolling = true;
 
@@ -618,19 +626,24 @@ class ActivityPoller {
       if (this.seenTrades.has(tradeKey)) continue;
       this.seenTrades.add(tradeKey);
 
-      // ────────────────────────────────────────────
-      //  🚨  NEW WHALE TRADE DETECTED
-      // ────────────────────────────────────────────
+      // ──────────────────────────────────────────────────────────
+      //  [TRADE SIGNAL] — BOLD banner logged BEFORE order is sent
+      // ──────────────────────────────────────────────────────────
       this.signalsDetected++;
 
       const emoji = sideEmoji(act.side);
       const tag = wTag(addr);
 
-      console.log(
-        `[${ts()}] ${emoji} 🚨 NEW SIGNAL — ${tag} ${act.side} ` +
-        `"${act.title || "?"}" [${act.outcome || "?"}] ` +
-        `@ ${act.price} (${act.size || "?"} shares)`,
-      );
+      console.log("");
+      console.log(`[${ts()}] ═══════════════════════════════════════════════════`);
+      console.log(`[${ts()}] ${emoji}  [TRADE SIGNAL]  ${act.side}  ${emoji}`);
+      console.log(`[${ts()}]    Whale:   ${tag}`);
+      console.log(`[${ts()}]    Market:  "${act.title || "?"}"`);
+      console.log(`[${ts()}]    Side:    ${act.side}  [${act.outcome || "?"}]`);
+      console.log(`[${ts()}]    Price:   ${act.price}  (${act.size || "?"} shares)`);
+      console.log(`[${ts()}]    Asset:   ${act.asset?.slice(0, 20)}…`);
+      console.log(`[${ts()}] ═══════════════════════════════════════════════════`);
+      console.log("");
 
       // Add to global watchlist + hot-subscribe on WS if first time seeing it
       const isNewAsset = !this.watchlist.has(act.asset);
@@ -702,13 +715,13 @@ class WhaleWatcher {
       (assetId) => this.hotSubscribe(assetId), // callback to subscribe new assets
     );
 
-    // Pulse timer
-    this._pulseInterval = null;
+    // Heartbeat timer
+    this._heartbeatInterval = null;
   }
 
   async start() {
     log.info("═══════════════════════════════════════════════════════════");
-    log.info("  Polymarket Whale Copy-Trader Bot  v3.0  (Activity Hunter)");
+    log.info("  Polymarket Whale Copy-Trader Bot  v3.1  (Production-Ready)");
     log.info("═══════════════════════════════════════════════════════════");
     log.info(`  Tracking ${CONFIG.WHALE_ADDRESSES.length} whale(s):`);
     for (const addr of CONFIG.WHALE_ADDRESSES) {
@@ -728,8 +741,8 @@ class WhaleWatcher {
     // 2. Start Activity Poller — the primary eye
     this.activityPoller.start();
 
-    // 3. Start the 1-second pulse log
-    this._startPulse();
+    // 3. Start the 10-second [HEARTBEAT] logger
+    this._startHeartbeat();
   }
 
   // ── Hot-subscribe: called by Activity Poller when a new asset is discovered ──
@@ -753,11 +766,14 @@ class WhaleWatcher {
   connect() {
     if (this.isShuttingDown) return;
 
-    log.ws(`Connecting to ${CONFIG.WS_URL}…`);
+    const attempt = this.reconnectAttempt || 0;
+    const attemptTag = attempt > 0 ? ` (reconnect #${attempt})` : " (initial)";
+
+    log.ws(`Connecting to ${CONFIG.WS_URL}…${attemptTag}`);
     this.ws = new WebSocket(CONFIG.WS_URL);
 
     this.ws.on("open", () => {
-      log.ws("Connected ✓");
+      log.ws(`✅ WebSocket CONNECTED${attemptTag} — ready to receive events`);
       this.reconnectAttempt = 0;
       this._resubscribeAll();
       this._startPing();
@@ -768,13 +784,13 @@ class WhaleWatcher {
     });
 
     this.ws.on("close", (code, reason) => {
-      log.ws(`Disconnected (code=${code}, reason=${reason || "none"})`);
+      log.ws(`❌ WebSocket CLOSED — code=${code} reason="${reason || "none"}"${attemptTag}`);
       this._stopPing();
       this._scheduleReconnect();
     });
 
     this.ws.on("error", (err) => {
-      log.error(`WebSocket error: ${err.message}`);
+      log.error(`WebSocket ERROR${attemptTag}: ${err.message}`);
     });
   }
 
@@ -887,32 +903,28 @@ class WhaleWatcher {
     return null;
   }
 
-  // ── 1-second Pulse log ──
+  // ── 10-second [HEARTBEAT] log — never-silent proof of life ──
 
-  _startPulse() {
-    this._pulseInterval = setInterval(() => {
+  _startHeartbeat() {
+    this._heartbeatInterval = setInterval(() => {
       const memMB = (process.memoryUsage().rss / 1024 / 1024).toFixed(1);
-      const wsState = this.ws?.readyState === WebSocket.OPEN ? "OPEN" : "CONNECTING";
-      const lastCheck = this.activityPoller.lastPollTs > 0
-        ? `${((Date.now() - this.activityPoller.lastPollTs) / 1000).toFixed(1)}s ago`
+      const lastResp = this.activityPoller.lastPollTs > 0
+        ? new Date(this.activityPoller.lastPollTs).toISOString().slice(11, 23)
         : "pending…";
 
-      log.pulse(
-        `[PULSE] Scanning ${CONFIG.WHALE_ADDRESSES.length} whales | ` +
-        `Monitoring ${this.subscribedAssets.size} assets | ` +
-        `Signals: ${this.activityPoller.signalsDetected} | ` +
-        `Polls: ${this.activityPoller.pollCount} | ` +
-        `WS=${wsState} | ` +
-        `Last API Check: ${lastCheck} | ` +
-        `Mem: ${memMB}MB`,
+      log.hb(
+        `[HEARTBEAT] Whales Scanned: ${CONFIG.WHALE_ADDRESSES.length} | ` +
+        `Total Assets Hooked: ${this.subscribedAssets.size} | ` +
+        `Last API Response: ${lastResp} | ` +
+        `Memory: ${memMB}MB`,
       );
-    }, CONFIG.PULSE_INTERVAL_MS);
+    }, CONFIG.HEARTBEAT_LOG_INTERVAL_MS);
   }
 
-  _stopPulse() {
-    if (this._pulseInterval) {
-      clearInterval(this._pulseInterval);
-      this._pulseInterval = null;
+  _stopHeartbeat() {
+    if (this._heartbeatInterval) {
+      clearInterval(this._heartbeatInterval);
+      this._heartbeatInterval = null;
     }
   }
 
@@ -942,8 +954,19 @@ class WhaleWatcher {
       CONFIG.WS_RECONNECT_BASE_MS * 2 ** (this.reconnectAttempt - 1),
       CONFIG.WS_RECONNECT_MAX_MS,
     );
-    log.ws(`Reconnecting in ${(delay / 1000).toFixed(1)}s (attempt #${this.reconnectAttempt})…`);
-    setTimeout(() => this.connect(), delay);
+    log.ws(
+      `🔄 RECONNECT SCHEDULED — attempt #${this.reconnectAttempt} ` +
+      `in ${(delay / 1000).toFixed(1)}s ` +
+      `(backoff: ${CONFIG.WS_RECONNECT_BASE_MS}ms × 2^${this.reconnectAttempt - 1}, ` +
+      `cap: ${CONFIG.WS_RECONNECT_MAX_MS / 1000}s)`,
+    );
+    setTimeout(() => {
+      log.ws(
+        `🔄 RECONNECT FIRING NOW — attempt #${this.reconnectAttempt} | ` +
+        `${this.subscribedAssets.size} asset(s) to re-subscribe`,
+      );
+      this.connect();
+    }, delay);
   }
 
   // ── Graceful shutdown ──
@@ -951,7 +974,7 @@ class WhaleWatcher {
   shutdown() {
     this.isShuttingDown = true;
     this._stopPing();
-    this._stopPulse();
+    this._stopHeartbeat();
     this.activityPoller.stop();
     if (this.ws) {
       this.ws.close(1000, "Bot shutting down");
