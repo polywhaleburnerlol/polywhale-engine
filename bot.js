@@ -32,7 +32,7 @@
 // Preserved from v2.x:
 //   • HTTP heartbeat on PORT (Render free-tier keep-alive)
 //   • trades.json persistence layer (crash recovery)
-//   • Liquidity engine (order book depth analysis via getSnapshot)
+//   • Liquidity engine (order book depth analysis via getOrderBook)
 //   • Hardened success gate (response.success === true only)
 //   • Multi-whale support from comma-separated env var
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -284,21 +284,21 @@ async function fetchMarketInfo(conditionId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Liquidity Engine — Order Book Depth  (unchanged, uses getSnapshot)
+// Liquidity Engine — Order Book Depth  (uses getOrderBook)
 // ─────────────────────────────────────────────────────────────────────────────
 async function checkLiquidity(clobClient, asset, side, whalePrice) {
-  let snapshot;
+  let orderBook;
   try {
-    snapshot = await clobClient.getSnapshot(asset);
+    orderBook = await clobClient.getOrderBook(asset);
   } catch (err) {
-    return { ok: false, reason: `Snapshot fetch failed: ${err.message}` };
+    return { ok: false, reason: `Order book fetch failed: ${err.message}` };
   }
 
-  if (!snapshot) return { ok: false, reason: "Snapshot returned null/undefined" };
+  if (!orderBook) return { ok: false, reason: "Order book returned null/undefined" };
 
   const levels = side === "BUY"
-    ? (snapshot.asks || [])
-    : (snapshot.bids || []);
+    ? (orderBook.asks || [])
+    : (orderBook.bids || []);
 
   if (levels.length === 0) {
     return { ok: false, reason: "No liquidity on relevant side of book" };
