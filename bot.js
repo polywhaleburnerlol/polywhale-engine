@@ -78,7 +78,7 @@ const CONFIG = Object.freeze({
 
   // Slippage
   MAX_SLIPPAGE: 0.05,
-  MAX_SLIPPAGE_PCT: 0.01,
+  MAX_SLIPPAGE_PCT: 0.05,
 
   // ── Activity Poller (the new primary detection engine) ──
   ACTIVITY_POLL_INTERVAL_MS: 2_000,   // poll every whale every 2 seconds
@@ -334,7 +334,7 @@ async function checkLiquidity(clobClient, asset, side, whalePrice) {
   if (fillVol < CONFIG.TRADE_AMOUNT_USD) {
     return {
       ok: false,
-      reason: `Only $${fillVol.toFixed(4)} fillable in 1% band (need $${CONFIG.TRADE_AMOUNT_USD})`,
+      reason: `Only $${fillVol.toFixed(4)} fillable in 5% band (need $${CONFIG.TRADE_AMOUNT_USD})`,
       fillableVolume: fillVol,
       effectivePrice,
     };
@@ -394,7 +394,7 @@ async function executeCopyTrade(clobClient, whaleTrade, tradeStore) {
     );
     log.warn(
       `   Reason: ${liquidity.reason} | whalePrice=${whalePrice.toFixed(4)} | ` +
-      `1% band=±${(whalePrice * CONFIG.MAX_SLIPPAGE_PCT).toFixed(4)}`,
+      `5% band=±${(whalePrice * CONFIG.MAX_SLIPPAGE_PCT).toFixed(4)}`,
     );
     return;
   }
