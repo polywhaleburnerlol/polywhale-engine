@@ -50,6 +50,10 @@ const CONFIG = Object.freeze({
   // e.g. 0.05 means we'll accept up to 5 cents worse than the whale's price
   MAX_SLIPPAGE: 0.05,
 
+  // Liquidity engine: max acceptable deviation from whale's price (1% = 0.01)
+  // The order book must have enough depth to fill our order within this band
+  MAX_SLIPPAGE_PCT: 0.01,
+
   // How often to refresh the whale's position list to discover new markets (ms)
   POSITION_REFRESH_INTERVAL_MS: 60_000,
 
@@ -247,6 +251,94 @@ function isDuplicate(assetId, side) {
   return false;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Liquidity Engine — Order Book Depth Analysis
+// ─────────────────────────────────────────────────────────────────────────────
+// Fetches the L2 order book for an asset and determines whether TRADE_AMOUNT_USD
+// can be filled within MAX_SLIPPAGE_PCT of the whale's reported price.
+//
+// Returns:
+//   { ok: true,  effectivePrice, fillableVolume }   — safe to execute
+//   { ok: false, reason, effectivePrice?, fillableVolume? } — skip trade
+// ─────────────────────────────────────────────────────────────────────────────
+async function checkLiquidity(clobClient, asset, side, whalePrice) {
+  let orderBook;
+  try {
+    orderBook = await clobClient.getMarketOrderBook(asset);
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `Order book fetch failed: ${err.message}`,
+    };
+  }
+
+  if (!orderBook) {
+    return { ok: false, reason: "Order book returned null/undefined" };
+  }
+
+  // For a BUY copy, we lift the Asks (sell side of the book).
+  // For a SELL copy, we hit the Bids (buy side of the book).
+  const levels = side === "BUY"
+    ? (orderBook.asks || [])
+    : (orderBook.bids || []);
+
+  if (levels.length === 0) {
+    return { ok: false, reason: "No liquidity levels on relevant side of book" };
+  }
+
+  // The 1% price band we'll tolerate
+  const maxDeviation = whalePrice * CONFIG.MAX_SLIPPAGE_PCT;
+  const priceCeiling = side === "BUY"
+    ? Math.min(whalePrice + maxDeviation, 0.99)  // worst ask we'd accept
+    : whalePrice;                                  // for sells, anything at or above floor
+  const priceFloor = side === "BUY"
+    ? whalePrice                                   // for buys, anything at or below ceiling
+    : Math.max(whalePrice - maxDeviation, 0.01);   // worst bid we'd accept
+
+  // Walk the book levels, accumulating fill volume within the price band
+  let fillableVolume = 0;   // total USDC fillable within band
+  let weightedCostSum = 0;  // for VWAP calculation
+
+  for (const level of levels) {
+    const levelPrice = parseFloat(level.price);
+    const levelSize  = parseFloat(level.size);
+
+    // Check price is within our acceptable band
+    if (side === "BUY" && levelPrice > priceCeiling) break;   // asks sorted ascending
+    if (side === "SELL" && levelPrice < priceFloor) break;     // bids sorted descending
+
+    const levelNotional = levelPrice * levelSize; // USDC value at this level
+
+    const remaining = CONFIG.TRADE_AMOUNT_USD - fillableVolume;
+    const take = Math.min(levelNotional, remaining);
+
+    fillableVolume += take;
+    weightedCostSum += levelPrice * (take / levelPrice); // shares × price for VWAP
+
+    if (fillableVolume >= CONFIG.TRADE_AMOUNT_USD) break;
+  }
+
+  const effectivePrice = fillableVolume > 0
+    ? weightedCostSum / (fillableVolume / (fillableVolume / weightedCostSum || 1))
+    : 0;
+
+  if (fillableVolume < CONFIG.TRADE_AMOUNT_USD) {
+    return {
+      ok: false,
+      reason:
+        `Only $${fillableVolume.toFixed(4)} fillable within 1% band ` +
+        `(need $${CONFIG.TRADE_AMOUNT_USD})`,
+      fillableVolume,
+      effectivePrice,
+    };
+  }
+
+  return { ok: true, effectivePrice, fillableVolume };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trade Execution — Hardened
+// ─────────────────────────────────────────────────────────────────────────────
 async function executeCopyTrade(clobClient, whaleTrade) {
   const { side, price, asset, conditionId, outcome, title } = whaleTrade;
 
@@ -257,22 +349,36 @@ async function executeCopyTrade(clobClient, whaleTrade) {
 
   log.whale(`Detected whale ${side} on "${title}" [${outcome}] @ ${price}`);
 
-  // Fetch market-specific parameters (tickSize, negRisk)
+  // ── Step 1: Fetch market-specific parameters (tickSize, negRisk) ──
   const marketInfo = await fetchMarketInfo(conditionId);
   if (!marketInfo) {
     log.error(`Cannot fetch market info for conditionId=${conditionId} — skipping`);
     return;
   }
 
-  // Calculate worst-price limit with slippage protection
+  // ── Step 2: Liquidity pre-flight via order book depth analysis ──
   const whalePrice = parseFloat(price);
+  const liquidity = await checkLiquidity(clobClient, asset, side, whalePrice);
+
+  if (!liquidity.ok) {
+    log.warn(
+      `⛔ LIQUIDITY WARNING: Spread too wide — skipping ${side} on "${title}" [${outcome}]`
+    );
+    log.warn(
+      `   Reason: ${liquidity.reason} | ` +
+      `whalePrice=${whalePrice.toFixed(4)} | ` +
+      `1% band=±${(whalePrice * CONFIG.MAX_SLIPPAGE_PCT).toFixed(4)}`
+    );
+    return;
+  }
+
+  // ── Step 3: Compute worst acceptable price from the liquidity band ──
+  const maxDeviation = whalePrice * CONFIG.MAX_SLIPPAGE_PCT;
   let worstPrice;
   if (side === "BUY") {
-    // For buys: we accept up to MAX_SLIPPAGE higher than whale's price
-    worstPrice = Math.min(whalePrice + CONFIG.MAX_SLIPPAGE, 0.99);
+    worstPrice = Math.min(whalePrice + maxDeviation, 0.99);
   } else {
-    // For sells: we accept up to MAX_SLIPPAGE lower than whale's price
-    worstPrice = Math.max(whalePrice - CONFIG.MAX_SLIPPAGE, 0.01);
+    worstPrice = Math.max(whalePrice - maxDeviation, 0.01);
   }
 
   const orderSide = side === "BUY" ? Side.BUY : Side.SELL;
@@ -280,9 +386,11 @@ async function executeCopyTrade(clobClient, whaleTrade) {
   log.trade(
     `Placing FOK ${side} | $${CONFIG.TRADE_AMOUNT_USD} USDC | ` +
     `token=${asset.slice(0, 12)}... | worst_price=${worstPrice.toFixed(4)} | ` +
-    `tick=${marketInfo.tickSize} | negRisk=${marketInfo.negRisk}`
+    `tick=${marketInfo.tickSize} | negRisk=${marketInfo.negRisk} | ` +
+    `bookDepth=$${liquidity.fillableVolume.toFixed(4)} available`
   );
 
+  // ── Step 4: Place the order ──
   try {
     const response = await clobClient.createAndPostMarketOrder(
       {
@@ -298,14 +406,32 @@ async function executeCopyTrade(clobClient, whaleTrade) {
       OrderType.FOK
     );
 
-    if (response && response.success !== false) {
+    // ── Hardened success check ──
+    // Only declare FILLED when the response object explicitly confirms it.
+    // A 403, network error, or missing `success` field must never be logged
+    // as a fill.
+    if (
+      response &&
+      typeof response === "object" &&
+      response.success === true
+    ) {
+      const orderId =
+        response.orderID || response.orderIds?.[0] || "N/A";
       log.trade(
-        `✅ Order FILLED — ${side} "${title}" [${outcome}] | ` +
-        `orderID=${response.orderID || response.orderIds?.[0] || "N/A"}`
+        `✅ Order FILLED — ${side} "${title}" [${outcome}] | orderID=${orderId}`
       );
     } else {
-      const reason = response?.errorMsg || response?.error || JSON.stringify(response);
-      log.error(`Order rejected: ${reason}`);
+      // Explicit failure or ambiguous response — never treat as success
+      const reason =
+        response?.errorMsg ||
+        response?.error ||
+        response?.message ||
+        JSON.stringify(response);
+      const status = response?.status || response?.statusCode || "";
+      log.error(
+        `Order NOT confirmed — ${side} "${title}" [${outcome}] | ` +
+        `status=${status} | reason=${reason}`
+      );
     }
   } catch (err) {
     handleOrderError(err, side, title, outcome);
@@ -315,7 +441,12 @@ async function executeCopyTrade(clobClient, whaleTrade) {
 function handleOrderError(err, side, title, outcome) {
   const msg = err.message || String(err);
 
-  if (msg.includes("not enough balance") || msg.includes("insufficient")) {
+  if (msg.includes("403") || msg.includes("Forbidden") || msg.includes("geo")) {
+    log.error(
+      `🚫 ACCESS DENIED (403) — your IP or account may be geoblocked by Polymarket. ` +
+      `${side} "${title}" [${outcome}] was NOT executed.`
+    );
+  } else if (msg.includes("not enough balance") || msg.includes("insufficient")) {
     log.error(
       `💸 INSUFFICIENT FUNDS — cannot ${side} "${title}" [${outcome}]. ` +
       `Top up your Polymarket wallet with USDC.e on Polygon.`
