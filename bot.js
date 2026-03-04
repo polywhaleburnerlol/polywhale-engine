@@ -296,9 +296,20 @@ async function checkLiquidity(clobClient, asset, side, whalePrice) {
 
   if (!orderBook) return { ok: false, reason: "Order book returned null/undefined" };
 
-  const levels = side === "BUY"
+  // Pull the relevant side: asks for BUY (we're lifting offers), bids for SELL
+  // (we're hitting bids). Explicitly sort so the early-exit `break` below works
+  // correctly regardless of the order the Polymarket API returns the levels in:
+  //   BUY  (asks) -> ascending  by price — cheapest ask first
+  //   SELL (bids) -> descending by price — highest bid first
+  const rawLevels = side === "BUY"
     ? (orderBook.asks || [])
     : (orderBook.bids || []);
+
+  const levels = [...rawLevels].sort((a, b) => {
+    const pa = parseFloat(a.price);
+    const pb = parseFloat(b.price);
+    return side === "BUY" ? pa - pb : pb - pa;
+  });
 
   if (levels.length === 0) {
     return { ok: false, reason: "No liquidity on relevant side of book" };
@@ -313,6 +324,9 @@ async function checkLiquidity(clobClient, asset, side, whalePrice) {
   for (const lv of levels) {
     const lp = parseFloat(lv.price);
     const ls = parseFloat(lv.size);
+
+    // Skip any malformed levels the API might return
+    if (!isFinite(lp) || !isFinite(ls) || ls <= 0) continue;
 
     if (side === "BUY"  && lp > ceiling) break;
     if (side === "SELL" && lp < floor)   break;
@@ -330,11 +344,12 @@ async function checkLiquidity(clobClient, asset, side, whalePrice) {
   }
 
   const effectivePrice = shares > 0 ? cost / shares : 0;
+  const bandLabel = `${(CONFIG.MAX_SLIPPAGE_PCT * 100).toFixed(0)}% band`;
 
   if (fillVol < CONFIG.TRADE_AMOUNT_USD) {
     return {
       ok: false,
-      reason: `Only $${fillVol.toFixed(4)} fillable in 5% band (need $${CONFIG.TRADE_AMOUNT_USD})`,
+      reason: `Only $${fillVol.toFixed(4)} fillable in ${bandLabel} (need $${CONFIG.TRADE_AMOUNT_USD})`,
       fillableVolume: fillVol,
       effectivePrice,
     };
@@ -394,7 +409,7 @@ async function executeCopyTrade(clobClient, whaleTrade, tradeStore) {
     );
     log.warn(
       `   Reason: ${liquidity.reason} | whalePrice=${whalePrice.toFixed(4)} | ` +
-      `5% band=±${(whalePrice * CONFIG.MAX_SLIPPAGE_PCT).toFixed(4)}`,
+      `${(CONFIG.MAX_SLIPPAGE_PCT * 100).toFixed(0)}% band=±${(whalePrice * CONFIG.MAX_SLIPPAGE_PCT).toFixed(4)}`,
     );
     return;
   }
