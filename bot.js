@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// Polymarket Whale Copy-Trader Bot  (v2.0 — Multi-Whale, Persistent, Hardened)
+// Polymarket Whale Copy-Trader Bot  (v2.1 — Paginated Discovery, Status Heartbeat)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // Monitors an array of whale addresses on Polymarket via WebSocket and mirrors
@@ -11,6 +11,12 @@
 //   • State persistence — filled orders saved to trades.json, loaded on boot
 //   • HTTP heartbeat — keeps Render's free tier from timing out on port scan
 //   • Hardened success check — only logs FILLED when response.success === true
+//
+// v2.1 changes:
+//   • Paginated position discovery — loops offset/limit to get ALL positions
+//   • Retry mechanism — 2 retries with 2s delay on 400/timeout per whale
+//   • Status heartbeat — logs monitoring status every 5s when idle
+//   • Diagnostic verbosity — dumps raw API response when 0 assets found
 //
 // Architecture:
 //   1. Bootstraps every whale's current open positions from the Data API
@@ -79,6 +85,17 @@ const CONFIG = Object.freeze({
 
   // Dedup window: ignore duplicate trade signals within this window (ms)
   DEDUP_WINDOW_MS: 5_000,
+
+  // Pagination settings for Data API /positions
+  POSITIONS_PAGE_LIMIT: 100,       // items per page (API default max)
+
+  // Retry settings for whale position fetches
+  FETCH_MAX_RETRIES: 2,            // retry up to 2× on 400/timeout
+  FETCH_RETRY_DELAY_MS: 2_000,     // wait 2s between retries
+  FETCH_TIMEOUT_MS: 15_000,        // per-request timeout
+
+  // Status heartbeat interval (passive monitoring log)
+  STATUS_LOG_INTERVAL_MS: 5_000,
 
   // Persistence file path
   TRADES_DB_PATH: path.resolve(process.cwd(), "trades.json"),
@@ -248,36 +265,157 @@ async function createClobClient() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Whale Position Discovery  (multi-whale)
+// Whale Position Discovery  (multi-whale, paginated, with retries)
 // ─────────────────────────────────────────────────────────────────────────────
-// Fetches positions for ALL whales in parallel via Promise.allSettled and
-// returns a single merged Map of asset_id → metadata.
-// When two whales hold the same asset the first-seen entry wins (the
-// metadata is identical across holders; verifyWhaleTrade still identifies
-// the actual actor at trade time).
+// For each whale:
+//   1. Paginates through the Data API /positions endpoint (offset + limit)
+//      until an empty page is returned, collecting ALL active positions.
+//   2. Retries up to FETCH_MAX_RETRIES times on 400s / timeouts / network
+//      errors, with a FETCH_RETRY_DELAY_MS pause between attempts.
+//   3. Logs the raw API response body when a whale yields 0 assets so you
+//      can diagnose exactly what the API is returning.
+//
+// Returns a single merged Map of asset_id → metadata across all whales.
 // ─────────────────────────────────────────────────────────────────────────────
+
+/** Sleep helper */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Fetch a single page of positions for one whale with timeout support.
+ * Returns the parsed JSON array, or throws on failure.
+ */
+async function fetchPositionsPage(addr, offset, limit) {
+  const url =
+    `${CONFIG.DATA_API}/positions` +
+    `?user=${addr}` +
+    `&offset=${offset}` +
+    `&limit=${limit}`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CONFIG.FETCH_TIMEOUT_MS);
+
+  try {
+    const resp = await fetch(url, { signal: controller.signal });
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "(unreadable)");
+      const err = new Error(
+        `HTTP ${resp.status} from /positions for ${addr} ` +
+        `(offset=${offset}): ${body}`,
+      );
+      err.status = resp.status;
+      err.body = body;
+      throw err;
+    }
+    return await resp.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Fetch ALL positions for a single whale, paginating until the API returns
+ * an empty page.  Retries on transient errors (400, timeout, network).
+ */
+async function fetchWhalePositionsPaginated(addr) {
+  const allPositions = [];
+  let offset = 0;
+  const limit = CONFIG.POSITIONS_PAGE_LIMIT;
+
+  // Outer loop: pages
+  while (true) {
+    let page = null;
+    let lastError = null;
+
+    // Inner loop: retries per page
+    for (let attempt = 0; attempt <= CONFIG.FETCH_MAX_RETRIES; attempt++) {
+      try {
+        page = await fetchPositionsPage(addr, offset, limit);
+        lastError = null;
+        break; // success — exit retry loop
+      } catch (err) {
+        lastError = err;
+        const retryable =
+          err.name === "AbortError" ||                     // timeout
+          (err.status && err.status >= 400 && err.status < 500) || // 4xx
+          err.message?.includes("fetch failed");           // network
+
+        if (retryable && attempt < CONFIG.FETCH_MAX_RETRIES) {
+          log.warn(
+            `  Retry ${attempt + 1}/${CONFIG.FETCH_MAX_RETRIES} for ${addr.slice(0, 10)}… ` +
+            `(offset=${offset}): ${err.message}`,
+          );
+          await sleep(CONFIG.FETCH_RETRY_DELAY_MS);
+        }
+      }
+    }
+
+    // If all retries failed for this page, abort this whale entirely
+    if (lastError) {
+      log.error(
+        `  Gave up fetching positions for ${addr} after ` +
+        `${CONFIG.FETCH_MAX_RETRIES + 1} attempts: ${lastError.message}`,
+      );
+      break;
+    }
+
+    // An empty page (or non-array) means we've consumed all positions
+    if (!Array.isArray(page) || page.length === 0) break;
+
+    allPositions.push(...page);
+
+    // If the page was smaller than the limit, there are no more pages
+    if (page.length < limit) break;
+
+    offset += limit;
+  }
+
+  return allPositions;
+}
+
 async function fetchAllWhalePositions() {
   const combined = new Map();
 
+  // Fetch all whales in parallel (each whale paginates internally)
   const results = await Promise.allSettled(
     CONFIG.WHALE_ADDRESSES.map(async (addr) => {
-      const url = `${CONFIG.DATA_API}/positions?user=${addr}`;
-      const resp = await fetch(url);
-      if (!resp.ok) {
-        throw new Error(`Data API /positions for ${addr} returned ${resp.status}`);
-      }
-      const positions = await resp.json();
+      const positions = await fetchWhalePositionsPaginated(addr);
       return { addr, positions };
     }),
   );
 
   for (const result of results) {
     if (result.status === "rejected") {
-      log.warn(`Whale position fetch failed: ${result.reason}`);
+      log.error(`Whale position fetch rejected: ${result.reason}`);
       continue;
     }
 
     const { addr, positions } = result.value;
+    const addrTag = `${addr.slice(0, 10)}…${addr.slice(-4)}`;
+
+    // ── Enhanced Error Verbosity: log raw response when 0 assets found ──
+    if (!positions || positions.length === 0) {
+      log.warn(
+        `  🔍 Whale ${addrTag} returned 0 positions. ` +
+        `Attempting single diagnostic fetch…`,
+      );
+      // Fire a one-shot diagnostic request so the raw response is visible in logs
+      try {
+        const diagUrl = `${CONFIG.DATA_API}/positions?user=${addr}&limit=5`;
+        const diagResp = await fetch(diagUrl);
+        const diagStatus = diagResp.status;
+        const diagBody = await diagResp.text().catch(() => "(unreadable)");
+        log.warn(
+          `  🔍 Diagnostic for ${addrTag}: HTTP ${diagStatus} | ` +
+          `body (first 500 chars): ${diagBody.slice(0, 500)}`,
+        );
+      } catch (diagErr) {
+        log.warn(`  🔍 Diagnostic fetch itself failed for ${addrTag}: ${diagErr.message}`);
+      }
+      continue;
+    }
+
+    let added = 0;
     for (const pos of positions) {
       if (pos.asset && pos.size > 0 && !combined.has(pos.asset)) {
         combined.set(pos.asset, {
@@ -288,8 +426,13 @@ async function fetchAllWhalePositions() {
           curPrice: pos.curPrice || 0,
           whaleAddress: addr,
         });
+        added++;
       }
     }
+
+    log.info(
+      `  ${addrTag}: ${positions.length} raw position(s) → ${added} new asset(s) added`,
+    );
   }
 
   return combined;
@@ -640,11 +783,13 @@ class WhaleWatcher {
     this.assetMap = new Map();   // asset_id → position metadata
     this.isShuttingDown = false;
     this._processingLock = new Set(); // per-asset lock to prevent races
+    this._statusInterval = null;      // periodic status heartbeat timer
+    this._lastActivityTs = Date.now(); // tracks last whale trade for idle detection
   }
 
   async start() {
     log.info("═══════════════════════════════════════════════════════════");
-    log.info("  Polymarket Whale Copy-Trader Bot  v2.0");
+    log.info("  Polymarket Whale Copy-Trader Bot  v2.1");
     log.info("═══════════════════════════════════════════════════════════");
     log.info(`  Tracking ${CONFIG.WHALE_ADDRESSES.length} whale(s):`);
     for (const addr of CONFIG.WHALE_ADDRESSES) {
@@ -662,7 +807,10 @@ class WhaleWatcher {
     // 2. Connect WebSocket
     this.connect();
 
-    // 3. Periodically refresh to discover new markets any whale enters
+    // 3. Start the passive monitoring status heartbeat
+    this.startStatusHeartbeat();
+
+    // 4. Periodically refresh to discover new markets any whale enters
     this.positionRefreshInterval = setInterval(async () => {
       await this.refreshWhalePositions();
       this.subscribeNewAssets();
@@ -803,6 +951,9 @@ class WhaleWatcher {
         `[${whaleTrade.outcome}] @ ${whaleTrade.price} (${whaleTrade.size} shares)`,
       );
 
+      // Reset idle timer — the status heartbeat uses this
+      this._lastActivityTs = Date.now();
+
       await executeCopyTrade(this.clobClient, whaleTrade, this.tradeStore);
     } finally {
       this._processingLock.delete(assetId);
@@ -825,8 +976,32 @@ class WhaleWatcher {
     }
   }
 
+  startStatusHeartbeat() {
+    this.stopStatusHeartbeat();
+    this._statusInterval = setInterval(() => {
+      const memMB = (process.memoryUsage().rss / 1024 / 1024).toFixed(1);
+      const idleSec = ((Date.now() - this._lastActivityTs) / 1000).toFixed(0);
+      const wsState = this.ws?.readyState === WebSocket.OPEN ? "OPEN" : "CLOSED";
+      console.log(
+        `[${ts()}] 📡 [STATUS] Engine active | ` +
+        `WS=${wsState} | ` +
+        `Monitoring ${this.assetMap.size} asset(s) from ${CONFIG.WHALE_ADDRESSES.length} whale(s) | ` +
+        `Idle ${idleSec}s | ` +
+        `Memory: ${memMB}MB`,
+      );
+    }, CONFIG.STATUS_LOG_INTERVAL_MS);
+  }
+
+  stopStatusHeartbeat() {
+    if (this._statusInterval) {
+      clearInterval(this._statusInterval);
+      this._statusInterval = null;
+    }
+  }
+
   cleanup() {
     this.stopPing();
+    this.stopStatusHeartbeat();
   }
 
   scheduleReconnect() {
