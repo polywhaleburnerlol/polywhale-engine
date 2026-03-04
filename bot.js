@@ -108,11 +108,11 @@ const CONFIG = Object.freeze({
 // Environment validation
 // ─────────────────────────────────────────────────────────────────────────────
 function validateEnv() {
-  const required = ["PRIVATE_KEY", "POLY_API_KEY", "POLY_SECRET", "POLY_PASSPHRASE"];
+  const required = ["PRIVATE_KEY", "POLY_API_KEY", "POLY_SECRET", "POLY_PASSPHRASE", "FUNDER_ADDRESS"];
   const missing = required.filter((k) => !process.env[k]);
   if (missing.length > 0) {
     console.error(`❌ Missing required env vars: ${missing.join(", ")}`);
-    console.error("   Create a .env file with: PRIVATE_KEY, POLY_API_KEY, POLY_SECRET, POLY_PASSPHRASE");
+    console.error("   Create a .env file with: PRIVATE_KEY, POLY_API_KEY, POLY_SECRET, POLY_PASSPHRASE, FUNDER_ADDRESS");
     process.exit(1);
   }
 }
@@ -244,18 +244,21 @@ async function createClobClient() {
     passphrase: process.env.POLY_PASSPHRASE,
   };
 
+  const funderAddress = process.env.FUNDER_ADDRESS;
+
   const client = new ClobClient(
     CONFIG.CLOB_HOST,
     CONFIG.CHAIN_ID,
     signer,
     creds,
-    0, // signatureType: 0 = EOA
+    2, // signatureType: 2 = Gnosis Safe proxy
+    funderAddress,
   );
 
   const ok = await client.getOk();
   if (ok !== "OK") throw new Error(`CLOB health check failed: ${ok}`);
 
-  log.info(`CLOB client initialized — your address: ${myAddress}`);
+  log.info(`CLOB client initialized — signer: ${myAddress} | funder: ${funderAddress}`);
   return { client, myAddress };
 }
 
@@ -746,7 +749,8 @@ class WhaleWatcher {
     log.info(`  Trade amount:   $${CONFIG.TRADE_AMOUNT_USD} USDC (FOK)`);
     log.info(`  Max slippage:   ${(CONFIG.MAX_SLIPPAGE_PCT * 100).toFixed(1)}% (order book depth)`);
     log.info(`  Dedup window:   ${CONFIG.DEDUP_WINDOW_MS / 1000}s`);
-    log.info(`  Your address:   ${this.myAddress}`);
+    log.info(`  Signer address: ${this.myAddress}`);
+    log.info(`  Funder address: ${process.env.FUNDER_ADDRESS} (Gnosis Safe proxy)`);
     log.info(`  Trade history:  ${this.tradeStore.trades.length} prior fill(s) loaded`);
     log.info("═══════════════════════════════════════════════════════════");
 
